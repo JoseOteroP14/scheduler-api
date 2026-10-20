@@ -1,0 +1,56 @@
+name: scheduler
+
+services:
+  db:
+    image: postgres:18.6-trixie
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: scheduler
+      POSTGRES_DB: scheduler
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      # Postgres 18+ images keep PGDATA at /var/lib/postgresql/18/docker; mount the parent so major upgrades can use pg_upgrade --link.
+      - pgdata:/var/lib/postgresql
+      - ./schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    shm_size: 256mb
+    stop_grace_period: 1m
+    healthcheck:
+      # TCP check: the entrypoint's temporary init server only listens on the Unix socket.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "scheduler", "-d", "scheduler"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
+  api:
+    build: .
+    image: scheduler-api:local
+    restart: unless-stopped
+    init: true
+    depends_on:
+      db:
+        condition: service_healthy
+        restart: true
+    environment:
+      PGHOST: db
+      PGPORT: 5432
+      PGUSER: scheduler
+      PGDATABASE: scheduler
+      PGPASSWORD_FILE: /run/secrets/postgres_password
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+    secrets:
+      - postgres_password
+    ports:
+      - "${API_PORT:-3000}:3000"
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password.txt
+
+volumes:
+  pgdata:
