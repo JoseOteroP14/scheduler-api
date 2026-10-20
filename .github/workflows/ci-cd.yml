@@ -1,0 +1,153 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Typecheck, test and publish image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    env:
+      PUBLISH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+
+      - run: bun install --frozen-lockfile
+
+      - run: bun run typecheck
+
+      - name: Compute image name
+        id: image
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Start API and database
+        env:
+          API_IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          mkdir -p secrets
+          openssl rand -hex 24 > secrets/postgres_password.txt
+          docker compose up -d --build --wait --wait-timeout 120
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          base=http://localhost:3000
+          curl -fsS "$base/health"
+          location=$(curl -fsS -o /dev/null -D - -X POST "$base/api/catalogs" \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"ci smoke","capturedAt":"2026-01-01T00:00:00Z","selectionOrder":"cpu","processes":[{"pid":1,"name":"init","priority":0,"cpuUsagePercent":1.5,"memoryUsageBytes":1024}]}' \
+            | tr -d '\r' | awk 'tolower($1) == "location:" { print $2 }')
+          test -n "$location"
+          curl -fsS "$base$location" | jq -e '.name == "ci smoke" and .processCount == 1 and .processes[0].pid == 1'
+          curl -fsS "$base/api/catalogs" | jq -e '.totalCount == 1'
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$base$location")" = 204
+          test "$(curl -s -o /dev/null -w '%{http_code}' "$base$location")" = 404
+
+      - name: Show container logs
+        if: failure()
+        run: docker compose logs
+
+      - name: Publish image to GHCR
+        if: env.PUBLISH == 'true'
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          latest="${IMAGE%:*}:latest"
+          docker tag "$IMAGE" "$latest"
+          docker push "$IMAGE"
+          docker push "$latest"
+
+      - name: Stop containers
+        if: always()
+        run: docker compose down -v
+
+  deploy:
+    name: Deploy to VPS
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    environment:
+      name: production
+      url: https://${{ vars.API_DOMAIN }}
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    env:
+      APP_DIR: /opt/scheduler
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          KNOWN_HOSTS: ${{ vars.VPS_KNOWN_HOSTS }}
+          VPS_HOST: ${{ vars.VPS_HOST }}
+          VPS_USER: ${{ vars.VPS_USER || 'deploy' }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host vps
+            HostName $VPS_HOST
+            User $VPS_USER
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+          EOF
+
+      - name: Upload deployment files
+        env:
+          API_IMAGE: ${{ needs.build.outputs.image }}
+          API_DOMAIN: ${{ vars.API_DOMAIN }}
+        run: |
+          {
+            echo "COMPOSE_FILE=compose.yaml:compose.prod.yaml"
+            echo "API_IMAGE=$API_IMAGE"
+            echo "API_DOMAIN=$API_DOMAIN"
+          } > .env.next
+          scp compose.yaml compose.prod.yaml Caddyfile schema.sql deploy/remote-deploy.sh .env.next "vps:$APP_DIR/"
+
+      - name: Deploy
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GHCR_TOKEN" | ssh vps "bash $APP_DIR/remote-deploy.sh '${{ github.actor }}'"
+
+      - name: Verify public health check
+        env:
+          API_DOMAIN: ${{ vars.API_DOMAIN }}
+        run: |
+          for attempt in $(seq 1 20); do
+            if curl -fsS --max-time 10 "https://$API_DOMAIN/health"; then
+              echo "https://$API_DOMAIN is healthy"
+              exit 0
+            fi
+            sleep 6
+          done
+          echo "::error::https://$API_DOMAIN/health did not become healthy"
+          exit 1

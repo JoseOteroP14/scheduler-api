@@ -29,7 +29,7 @@ services:
 
   api:
     build: .
-    image: scheduler-api:local
+    image: ${API_IMAGE:-scheduler-api:local}
     restart: unless-stopped
     init: true
     depends_on:
@@ -42,7 +42,6 @@ services:
       PGUSER: scheduler
       PGDATABASE: scheduler
       PGPASSWORD_FILE: /run/secrets/postgres_password
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
     secrets:
       - postgres_password
     ports:

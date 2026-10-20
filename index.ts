@@ -1,7 +1,6 @@
 import { SQL } from "bun";
 
 const sql = new SQL({ connection: { TimeZone: "UTC" } });
-const corsOrigins = Bun.env.CORS_ORIGINS?.split(",") ?? [];
 
 type ProcessRequest = {
   pid: number;
@@ -25,11 +24,8 @@ const cors =
   <T extends Request>(handler: (req: T) => Promise<Response>) =>
   async (req: T) => {
     const res = await handler(req);
-    const origin = req.headers.get("origin");
-    if (origin && corsOrigins.includes(origin)) {
-      res.headers.set("Access-Control-Allow-Origin", origin);
-      res.headers.set("Access-Control-Expose-Headers", "Location");
-    }
+    res.headers.set("Access-Control-Allow-Origin", "*");
+    res.headers.set("Access-Control-Expose-Headers", "Location");
     return res;
   };
 
@@ -182,14 +178,12 @@ const server = Bun.serve({
   fetch(req) {
     const requestMethod = req.headers.get("access-control-request-method");
     if (req.method === "OPTIONS" && requestMethod) {
-      const origin = req.headers.get("origin");
-      const headers = new Headers();
-      if (origin && corsOrigins.includes(origin)) {
-        headers.set("Access-Control-Allow-Origin", origin);
-        headers.set("Access-Control-Allow-Methods", requestMethod);
-        const requestHeaders = req.headers.get("access-control-request-headers");
-        if (requestHeaders) headers.set("Access-Control-Allow-Headers", requestHeaders);
-      }
+      const headers = new Headers({
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": requestMethod,
+      });
+      const requestHeaders = req.headers.get("access-control-request-headers");
+      if (requestHeaders) headers.set("Access-Control-Allow-Headers", requestHeaders);
       return empty(204, headers);
     }
 

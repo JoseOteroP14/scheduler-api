@@ -1,0 +1,27 @@
+# Production override used on the VPS: compose.yaml + compose.prod.yaml (selected via COMPOSE_FILE in the VPS .env).
+services:
+  api:
+    build: !reset null
+    image: ${API_IMAGE:?API_IMAGE must be set}
+    ports: !reset []
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      API_DOMAIN: ${API_DOMAIN:?API_DOMAIN must be set}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
